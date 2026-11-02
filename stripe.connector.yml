@@ -2,19 +2,23 @@ name: stripe
 display_name: Stripe API
 version: "1.0.0"
 
-api:
-  base_url: https://api.stripe.com
-  timeout_seconds: 15
-  retries: 3
+source:
+  type: stripe
+  resource: customers
+  api:
+    base_url: https://api.stripe.com
+    timeout_seconds: 15
+    retries: 3
+  auth:
+    type: bearer
+    token_env: STRIPE_SECRET_KEY
+  headers:
+    Accept: application/json
+    User-Agent: standardized-api-connector/1.0
 
-auth:
-  type: bearer
-  token_env: STRIPE_SECRET_KEY
+pipeline:
+  format: jsonl
 
-headers:
-  Accept: application/json
-  User-Agent: standardized-api-connector/1.0
-
-runtime:
-  language: python
-  package_name: stripe_connector
+sink:
+  type: local
+  limit: 10
