@@ -31,7 +31,6 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
 addopts = ["--cov=connector_cli", "--cov-report=term-missing"]
 
 [tool.coverage.report]
