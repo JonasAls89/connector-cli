@@ -1,108 +1,195 @@
-import copy
-
 import pytest
 import yaml
 
 from connector_cli.cli import main
 from connector_cli.config import ConfigError, load, parse
-
-VALID = {
-    "name": "stripe",
-    "source": {
-        "type": "stripe",
-        "resource": "customers",
-        "api": {"base_url": "https://api.stripe.com", "timeout_seconds": 15, "retries": 3},
-        "auth": {"type": "bearer", "token_env": "STRIPE_SECRET_KEY"},
-        "headers": {"Accept": "application/json"},
-    },
-    "pipeline": {"select": ["id"], "rename": {"id": "x"}, "cast": {"x": "int"}, "format": "csv"},
-    "sink": {"type": "local", "limit": 5, "path": "out"},
-}
+from connector_cli.runtime import default_registry
 
 
-def errors_for(mutate) -> list[str]:
-    data = copy.deepcopy(VALID)
-    mutate(data)
-    with pytest.raises(ConfigError) as exc:
-        parse(data)
-    return exc.value.errors
+def test_defaults(definition):
+    connector = parse(definition)
+    assert connector.schema_version == 1
+    assert connector.limit is None
+    assert connector.source.timeout_seconds == 15
+    assert connector.source.retries == 3
+    assert connector.source.max_retry_delay_seconds == 60
+    assert connector.source.auth.type == "none"
+    assert connector.source.pagination.type == "none"
+    assert connector.pipeline.type == "records"
+    assert connector.pipeline.format == "jsonl"
 
 
-def test_valid_full():
-    c = parse(VALID)
-    assert c.source.resource == "customers"
-    assert c.pipeline.format == "csv"
-    assert c.sink.limit == 5
+@pytest.mark.parametrize("filename", ["stripe.connector.yml", "enhetsregisteret.connector.yml"])
+def test_reference_definitions(filename):
+    connector = load(filename)
+    default_registry().validate(connector)
+    assert connector.source.type == "rest"
+    assert connector.limit == 10
 
 
-def test_defaults():
-    c = parse({"source": {"type": "stripe", "resource": "r"}, "sink": {"type": "local"}})
-    assert c.source.timeout_seconds == 15
-    assert c.source.retries == 3
-    assert c.sink.limit == 10
-    assert c.pipeline.format == "jsonl"
-
-
-def test_repo_connector_file_is_valid():
-    assert load("stripe.connector.yml").source.type == "stripe"
+def test_full_definition(definition):
+    definition.update(name="example", display_name="Example", version="1.0", limit=20)
+    definition["source"].update(
+        query={"size": 20, "active": True, "ratio": 1.5, "name": "example"},
+        headers={"Accept": "application/json"},
+        auth={"type": "basic", "username_env": "API_USER", "password_env": "API_PASSWORD"},
+        pagination={"type": "page", "param": "page", "start": 1, "total_pages_path": "pages"},
+    )
+    definition["pipeline"] = {
+        "select": ["nested.id", "missing"],
+        "rename": {"nested.id": "id"},
+        "flatten": True,
+        "format": "csv",
+        "csv": {"columns": ["id", "missing"], "json_cells": True},
+    }
+    connector = parse(definition)
+    assert connector.name == "example"
+    assert connector.source.auth.username_env == "API_USER"
+    assert connector.source.pagination.start == 1
+    assert connector.pipeline.columns == ["id", "missing"]
+    assert connector.pipeline.json_cells
 
 
 @pytest.mark.parametrize(
-    ("mutate", "expected"),
+    ("section", "changes", "expected"),
     [
-        (lambda d: d["source"].pop("resource"), "source.resource: required"),
-        (lambda d: d.pop("sink"), "sink: required section"),
-        (lambda d: d.pop("source"), "source: required section"),
-        (lambda d: d["source"].update(extra=1), "source.extra: unknown key"),
-        (lambda d: d["sink"].update(extra=1), "sink.extra: unknown key"),
-        (lambda d: d["pipeline"].update(extra=1), "pipeline.extra: unknown key"),
-        (lambda d: d.update(runtime={}), "runtime: unknown key"),
-        (lambda d: d["source"].update(type="x"), "source.type: must be one of"),
-        (lambda d: d["sink"].update(type="s3"), "sink.type: must be one of"),
-        (lambda d: d["pipeline"].update(cast={"a": "date"}), "pipeline.cast.a: must be one of"),
-        (lambda d: d["pipeline"].update(cast=[1]), "pipeline.cast: must be a mapping"),
-        (lambda d: d["pipeline"].update(format="parquet"), "pipeline.format: must be one of"),
-        (lambda d: d["pipeline"].update(select="id"), "pipeline.select: must be a list"),
-        (lambda d: d["pipeline"].update(rename={"a": 1}), "pipeline.rename: must be a mapping"),
-        (lambda d: d["sink"].update(limit=0), "sink.limit: must be an integer"),
-        (lambda d: d["sink"].update(limit=True), "sink.limit: must be an integer"),
-        (lambda d: d["sink"].update(path=""), "sink.path: must be a non-empty"),
-        (lambda d: d["source"]["api"].update(retries=-1), "source.api.retries"),
-        (lambda d: d["source"]["api"].update(base_url=3), "source.api.base_url"),
-        (lambda d: d["source"]["auth"].pop("type"), "source.auth.type: required"),
-        (lambda d: d["source"].update(auth=[]), "source.auth: must be a mapping"),
-        (lambda d: d["source"].update(headers={"a": 1}), "source.headers: must be a mapping"),
-        (lambda d: d["source"].update(api=[]), "source.api: must be a mapping"),
-        (lambda d: d["source"].update(resource=3), "source.resource: must be a non-empty"),
-        (lambda d: d.update(source=[]), "source: must be a mapping"),
-        (lambda d: d.update(pipeline=[]), "pipeline: must be a mapping"),
-        (lambda d: d.update(name=3), "name: must be a non-empty"),
+        ("", {"schema_version": 2}, "schema_version"),
+        ("", {"schema_version": True}, "schema_version"),
+        ("", {"schema_version": "1"}, "schema_version"),
+        ("", {"limit": 0}, "limit"),
+        ("", {"limit": True}, "limit"),
+        ("", {"name": 1}, "name"),
+        ("", {"extra": 1}, "unknown key"),
+        ("source", {"type": ""}, "source.type"),
+        ("source", {"url": 3}, "source.url"),
+        ("source", {"url": "file:///tmp/records"}, "source.url"),
+        ("source", {"url": "https://user:example@example.test/items"}, "source.url"),
+        ("source", {"url": "https://example.test/items?key=example"}, "source.url"),
+        ("source", {"url": "https://example.test/items#fragment"}, "source.url"),
+        ("source", {"url": "https://example.test:bad/items"}, "source.url"),
+        ("source", {"extra": 1}, "source.extra"),
+        ("source", {"records_path": "a..b"}, "records_path"),
+        ("source", {"timeout_seconds": 0}, "timeout_seconds"),
+        ("source", {"retries": 11}, "retries"),
+        ("source", {"max_retry_delay_seconds": 0}, "max_retry_delay_seconds"),
+        ("source", {"query": []}, "source.query"),
+        ("source", {"query": {"x": None}}, "source.query"),
+        ("source", {"query": {"x": float("inf")}}, "source.query"),
+        ("source", {"headers": {"x": 1}}, "source.headers"),
+        ("source", {"headers": {"Authorization": "example"}}, "source.headers"),
+        ("source", {"headers": {"Cookie": "example"}}, "source.headers"),
+        ("source", {"headers": {"Host": "example.test"}}, "source.headers"),
+        ("source", {"headers": {"bad key": "x"}}, "source.headers"),
+        ("source", {"headers": {"X-Header": "a\nb"}}, "source.headers"),
+        ("source", {"headers": {"X-Header": "\u00e6"}}, "source.headers"),
+        ("source", {"auth": []}, "source.auth"),
+        ("source", {"auth": {"type": "oauth"}}, "source.auth.type"),
+        ("source", {"auth": {"type": "bearer"}}, "token_env"),
+        ("source", {"auth": {"type": "bearer", "token_env": "not-an-env"}}, "token_env"),
+        ("source", {"auth": {"type": "none", "token_env": "TOKEN"}}, "token_env"),
+        ("source", {"auth": {"type": "basic", "username_env": "USER"}}, "password_env"),
+        ("source", {"pagination": []}, "source.pagination"),
+        ("source", {"pagination": {"type": "offset"}}, "source.pagination.type"),
+        ("source", {"pagination": {"type": "page"}}, "source.pagination.param"),
+        ("source", {"pagination": {"type": "page", "param": "page", "start": 2}}, "start"),
+        ("source", {"pagination": {"type": "cursor", "param": "after"}}, "cursor_path"),
+        ("source", {"pagination": {"type": "next_link"}}, "next_path"),
+        ("source", {"pagination": {"type": "none", "next_path": "next"}}, "unknown key"),
+        ("pipeline", {"type": 3}, "pipeline.type"),
+        ("pipeline", {"select": "id"}, "pipeline.select"),
+        ("pipeline", {"select": ["id", "id"]}, "duplicates"),
+        ("pipeline", {"select": ["a..b"]}, "field path"),
+        ("pipeline", {"rename": {"id": 3}}, "pipeline.rename"),
+        ("pipeline", {"select": ["id"], "rename": {"other": "x"}}, "selected fields"),
+        ("pipeline", {"select": ["id", "x"], "rename": {"id": "x"}}, "collide"),
+        ("pipeline", {"flatten": "yes"}, "pipeline.flatten"),
+        ("pipeline", {"format": "parquet"}, "pipeline.format"),
+        ("pipeline", {"format": "csv"}, "pipeline.csv.columns"),
+        ("pipeline", {"format": "csv", "csv": {"columns": []}}, "at least one"),
+        ("pipeline", {"format": "csv", "csv": {"columns": ["a", "a"]}}, "duplicates"),
+        ("pipeline", {"format": "csv", "csv": {"columns": ["a"], "json_cells": 1}}, "boolean"),
+        ("pipeline", {"csv": {"columns": ["id"]}}, "only valid"),
+        ("pipeline", {"cast": {"id": "int"}}, "unknown key"),
+        ("sink", {"path": ""}, "sink.path"),
+        ("sink", {"path": "\x00"}, "sink.path"),
+        ("sink", {"limit": 10}, "unknown key"),
     ],
 )
-def test_invalid(mutate, expected):
-    assert any(expected in e for e in errors_for(mutate))
+def test_invalid_fields(definition, section, changes, expected):
+    target = definition.setdefault(section, {}) if section else definition
+    target.update(changes)
+    with pytest.raises(ConfigError, match=expected):
+        parse(definition)
 
 
-def test_root_not_mapping():
+@pytest.mark.parametrize("key", ["schema_version", "source", "sink"])
+def test_required_sections(definition, key):
+    del definition[key]
+    with pytest.raises(ConfigError, match="required key"):
+        parse(definition)
+
+
+@pytest.mark.parametrize("section", ["source", "pipeline", "sink"])
+def test_sections_must_be_mappings(definition, section):
+    definition[section] = []
+    with pytest.raises(ConfigError, match="must be a mapping"):
+        parse(definition)
+
+
+def test_root_and_mapping_keys(definition):
     with pytest.raises(ConfigError, match="<root>"):
         parse([1])
+    definition[False] = "not a string key"
+    with pytest.raises(ConfigError, match="keys must be strings"):
+        parse(definition)
 
 
-def test_load_errors(tmp_path):
+def test_https_auth_and_pagination_owned_query(definition):
+    definition["source"].update(
+        url="http://example.test/items",
+        auth={"type": "bearer", "token_env": "TOKEN"},
+        query={"page": 2},
+        pagination={"type": "page", "param": "page"},
+    )
+    with pytest.raises(ConfigError) as error:
+        parse(definition)
+    assert "authentication requires HTTPS" in str(error.value)
+    assert "pagination-owned" in str(error.value)
+
+
+def test_load_failures_do_not_echo_contents(tmp_path):
     with pytest.raises(ConfigError, match="cannot read"):
         load(tmp_path / "missing.yml")
-    bad = tmp_path / "bad.yml"
-    bad.write_text("a: [", encoding="utf-8")
+    path = tmp_path / "bad.yml"
+    path.write_text("example-secret-value: [", encoding="utf-8")
+    with pytest.raises(ConfigError, match="invalid YAML") as error:
+        load(path)
+    assert "example-secret-value" not in str(error.value)
+    path.write_bytes(b"\xff")
+    with pytest.raises(ConfigError, match="UTF-8"):
+        load(path)
+
+
+def test_duplicate_yaml_keys_and_unsafe_tags_are_rejected(tmp_path):
+    path = tmp_path / "duplicate.yml"
+    path.write_text("schema_version: 1\nschema_version: 1\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="invalid YAML"):
-        load(bad)
+        load(path)
+    path.write_text("\x00", encoding="utf-8")
+    with pytest.raises(ConfigError, match="invalid YAML"):
+        load(path)
+    path.write_text("!!python/object:builtins.object {}", encoding="utf-8")
+    with pytest.raises(ConfigError, match="invalid YAML"):
+        load(path)
 
 
-def test_cli(tmp_path, capsys):
-    good = tmp_path / "g.yml"
-    good.write_text(yaml.safe_dump(VALID), encoding="utf-8")
-    assert main(["validate", str(good)]) == 0
+def test_offline_cli_validation(definition, tmp_path, capsys):
+    definition["source"]["auth"] = {"type": "bearer", "token_env": "UNSET_TEST_TOKEN"}
+    path = tmp_path / "connector.yml"
+    path.write_text(yaml.safe_dump(definition), encoding="utf-8")
+    assert main(["validate", str(path)], registry=default_registry(environ={})) == 0
     assert "valid" in capsys.readouterr().out
-    bad = tmp_path / "b.yml"
-    bad.write_text("source: {}\n", encoding="utf-8")
-    assert main(["validate", str(bad)]) == 1
-    assert "source.type: required" in capsys.readouterr().err
+    definition["source"]["type"] = "unregistered"
+    path.write_text(yaml.safe_dump(definition), encoding="utf-8")
+    assert main(["validate", str(path)]) == 1
+    assert "source.type: no adapter is registered" in capsys.readouterr().err

@@ -1,219 +1,372 @@
-"""Connector file schema and strict validation."""
+"""Versioned connector definitions and offline, value-safe validation."""
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
 import yaml
-
-SOURCE_TYPES = ("stripe",)
-SINK_TYPES = ("local",)
-CAST_TYPES = ("string", "int", "float", "bool")
-FORMATS = ("jsonl", "csv")
 
 
 class ConfigError(Exception):
-    """Raised with all validation errors, each naming a field path."""
+    """Validation errors naming field paths, without echoing configuration values."""
 
     def __init__(self, errors: list[str]) -> None:
         super().__init__("\n".join(errors))
         self.errors = errors
 
 
+class _StrictSafeLoader(yaml.SafeLoader):
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+        self.flatten_mapping(node)
+        seen: set[str] = set()
+        for key, _ in node.value:
+            if isinstance(key, yaml.ScalarNode) and key.tag == "tag:yaml.org,2002:str":
+                if key.value in seen:
+                    raise yaml.constructor.ConstructorError(problem="duplicate mapping key")
+                seen.add(key.value)
+        return super().construct_mapping(node, deep=deep)
+
+
+@dataclass
+class Auth:
+    type: str = "none"
+    token_env: str | None = None
+    username_env: str | None = None
+    password_env: str | None = None
+
+
+@dataclass
+class Pagination:
+    type: str = "none"
+    param: str = ""
+    start: int = 0
+    cursor_path: str = ""
+    has_more_path: str = ""
+    total_pages_path: str = ""
+    next_path: str = ""
+    max_records: int | None = None
+
+
 @dataclass
 class Source:
     type: str
-    resource: str
-    base_url: str | None = None
+    url: str
+    records_path: str = ""
+    query: dict[str, str | int | float | bool] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+    auth: Auth = field(default_factory=Auth)
+    pagination: Pagination = field(default_factory=Pagination)
     timeout_seconds: int = 15
     retries: int = 3
-    auth_type: str | None = None
-    token_env: str | None = None
-    headers: dict[str, str] = field(default_factory=dict)
+    max_retry_delay_seconds: int = 60
 
 
 @dataclass
 class Pipeline:
+    type: str = "records"
     select: list[str] | None = None
     rename: dict[str, str] = field(default_factory=dict)
-    cast: dict[str, str] = field(default_factory=dict)
+    flatten: bool = False
     format: str = "jsonl"
+    columns: list[str] = field(default_factory=list)
+    json_cells: bool = False
 
 
 @dataclass
 class Sink:
     type: str
-    limit: int = 10
-    path: str | None = None
+    path: str
 
 
 @dataclass
 class Connector:
-    name: str | None
-    display_name: str | None
-    version: str | None
+    schema_version: int
     source: Source
     pipeline: Pipeline
     sink: Sink
+    limit: int | None = None
+    name: str | None = None
+    display_name: str | None = None
+    version: str | None = None
 
 
-def _is_int(value: Any) -> bool:
+def is_integer(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _is_str_map(value: Any) -> bool:
-    return isinstance(value, dict) and all(
-        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
-    )
 
 
 class _Validator:
     def __init__(self) -> None:
         self.errors: list[str] = []
 
-    def err(self, path: str, msg: str) -> None:
-        self.errors.append(f"{path}: {msg}")
+    def err(self, path: str, message: str) -> None:
+        self.errors.append(f"{path}: {message}")
 
     def section(
-        self, data: Any, path: str, required: tuple[str, ...], optional: tuple[str, ...]
-    ) -> dict[str, Any] | None:
+        self, data: Any, path: str, required: tuple[str, ...], optional: tuple[str, ...] = ()
+    ) -> dict[str, Any]:
         if not isinstance(data, dict):
-            self.err(path, "must be a mapping")
-            return None
+            self.err(path or "<root>", "must be a mapping")
+            return {}
         for key in data:
-            if key not in required and key not in optional:
-                self.err(f"{path}.{key}", "unknown key")
+            if not isinstance(key, str):
+                self.err(path, "keys must be strings")
+            elif key not in required and key not in optional:
+                self.err(f"{path}.{key}" if path else key, "unknown key")
         for key in required:
             if key not in data:
-                self.err(f"{path}.{key}", "required key is missing")
+                self.err(f"{path}.{key}" if path else key, "required key is missing")
         return data
 
-    def string(self, data: dict[str, Any], key: str, path: str) -> str | None:
-        if key not in data:
-            return None
-        value = data[key]
-        if not isinstance(value, str) or not value:
-            self.err(f"{path}.{key}", "must be a non-empty string")
-            return None
-        return value
-
-    def choice(self, data: dict[str, Any], key: str, path: str, allowed: tuple[str, ...]) -> Any:
-        value = self.string(data, key, path)
-        if value is not None and value not in allowed:
-            self.err(f"{path}.{key}", f"must be one of {', '.join(allowed)}")
-            return None
-        return value
-
-    def integer(self, data: dict[str, Any], key: str, path: str, default: int, minimum: int) -> int:
-        if key not in data:
-            return default
-        value = data[key]
-        if not _is_int(value) or value < minimum:
-            self.err(f"{path}.{key}", f"must be an integer >= {minimum}")
+    def string(
+        self, data: dict[str, Any], key: str, path: str, default: str = "", *, empty: bool = False
+    ) -> str:
+        value = data.get(key, default)
+        if (
+            not isinstance(value, str)
+            or (not value and not empty)
+            or any(ord(char) < 32 for char in value)
+        ):
+            self.err(f"{path}.{key}", "must be a non-empty string without control characters")
             return default
         return value
 
-    def str_map(self, data: dict[str, Any], key: str, path: str) -> dict[str, str]:
+    def choice(self, data: dict[str, Any], key: str, path: str, choices: tuple[str, ...]) -> str:
+        value = self.string(data, key, path, choices[0])
+        if value not in choices:
+            self.err(f"{path}.{key}", f"must be one of {', '.join(choices)}")
+            return choices[0]
+        return value
+
+    def integer(
+        self, data: dict[str, Any], key: str, path: str, default: int, minimum: int, maximum: int
+    ) -> int:
+        value = data.get(key, default)
+        if not is_integer(value) or not minimum <= value <= maximum:
+            self.err(f"{path}.{key}", f"must be an integer between {minimum} and {maximum}")
+            return default
+        return value
+
+    def boolean(self, data: dict[str, Any], key: str, path: str) -> bool:
+        value = data.get(key, False)
+        if not isinstance(value, bool):
+            self.err(f"{path}.{key}", "must be a boolean")
+            return False
+        return value
+
+    def path(self, data: dict[str, Any], key: str, path: str, *, root: bool = False) -> str:
+        value = self.string(data, key, path, empty=root)
+        if value and any(not part for part in value.split(".")):
+            self.err(f"{path}.{key}", "must be a dot-separated field path")
+        return value
+
+    def strings(self, data: dict[str, Any], key: str, path: str) -> list[str]:
+        value = data.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(s, str) and s for s in value):
+            self.err(f"{path}.{key}", "must be a list of non-empty strings")
+            return []
+        if len(set(value)) != len(value):
+            self.err(f"{path}.{key}", "must not contain duplicates")
+        return value
+
+    def string_map(self, data: dict[str, Any], key: str, path: str) -> dict[str, str]:
         value = data.get(key, {})
-        if not _is_str_map(value):
-            self.err(f"{path}.{key}", "must be a mapping of strings to strings")
+        if not isinstance(value, dict) or not all(
+            isinstance(k, str) and k and isinstance(v, str) and v for k, v in value.items()
+        ):
+            self.err(f"{path}.{key}", "must be a mapping of non-empty strings")
             return {}
         return value
 
-    def source(self, data: Any) -> Source | None:
-        d = self.section(data, "source", ("type", "resource"), ("api", "auth", "headers"))
-        if d is None:
-            return None
-        src = Source(
-            type=self.choice(d, "type", "source", SOURCE_TYPES) or "",
-            resource=self.string(d, "resource", "source") or "",
+    def auth(self, data: Any) -> Auth:
+        path = "source.auth"
+        d = self.section(data, path, (), ("type", "token_env", "username_env", "password_env"))
+        kind = self.choice(d, "type", path, ("none", "bearer", "basic"))
+        required = {"none": (), "bearer": ("token_env",), "basic": ("username_env", "password_env")}
+        result = Auth(type=kind)
+        for key in ("token_env", "username_env", "password_env"):
+            if key in required[kind]:
+                value = self.string(d, key, path)
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+                    self.err(f"{path}.{key}", "must name an environment variable")
+                setattr(result, key, value)
+            elif key in d:
+                self.err(f"{path}.{key}", "not used by this authentication type")
+        return result
+
+    def pagination(self, data: Any) -> Pagination:
+        path = "source.pagination"
+        if not isinstance(data, dict):
+            self.err(path, "must be a mapping")
+            return Pagination()
+        kind = self.choice(data, "type", path, ("none", "page", "cursor", "next_link"))
+        required = {
+            "none": (),
+            "page": ("param",),
+            "cursor": ("param", "cursor_path", "has_more_path"),
+            "next_link": ("next_path",),
+        }
+        optional = {
+            "none": (),
+            "page": ("start", "total_pages_path", "max_records"),
+            "cursor": ("max_records",),
+            "next_link": ("max_records",),
+        }
+        d = self.section(data, path, required[kind], ("type", *optional[kind]))
+        result = Pagination(type=kind)
+        if "param" in required[kind]:
+            result.param = self.string(d, "param", path)
+        for key in ("cursor_path", "has_more_path", "total_pages_path", "next_path"):
+            if key in d or key in required[kind]:
+                setattr(result, key, self.path(d, key, path))
+        if kind == "page":
+            result.start = self.integer(d, "start", path, 0, 0, 1)
+        if "max_records" in d:
+            result.max_records = self.integer(d, "max_records", path, 1, 1, 2**63 - 1)
+        return result
+
+    def source(self, data: Any) -> Source:
+        d = self.section(
+            data,
+            "source",
+            ("type", "url"),
+            (
+                "records_path",
+                "query",
+                "headers",
+                "auth",
+                "pagination",
+                "timeout_seconds",
+                "retries",
+                "max_retry_delay_seconds",
+            ),
         )
-        api = d.get("api", {})
-        a = self.section(api, "source.api", (), ("base_url", "timeout_seconds", "retries"))
-        if a is not None:
-            src.base_url = self.string(a, "base_url", "source.api")
-            src.timeout_seconds = self.integer(a, "timeout_seconds", "source.api", 15, 1)
-            src.retries = self.integer(a, "retries", "source.api", 3, 0)
-        if "auth" in d:
-            au = self.section(d["auth"], "source.auth", ("type", "token_env"), ())
-            if au is not None:
-                src.auth_type = self.string(au, "type", "source.auth")
-                src.token_env = self.string(au, "token_env", "source.auth")
-        if "headers" in d:
-            src.headers = self.str_map(d, "headers", "source")
-        return src
+        source = Source(
+            type=self.string(d, "type", "source"),
+            url=self.string(d, "url", "source"),
+            records_path=self.path(d, "records_path", "source", root=True),
+            headers=self.string_map(d, "headers", "source"),
+            auth=self.auth(d.get("auth", {})),
+            pagination=self.pagination(d.get("pagination", {})),
+            timeout_seconds=self.integer(d, "timeout_seconds", "source", 15, 1, 3600),
+            retries=self.integer(d, "retries", "source", 3, 0, 10),
+            max_retry_delay_seconds=self.integer(
+                d, "max_retry_delay_seconds", "source", 60, 1, 3600
+            ),
+        )
+        try:
+            url = httpx.URL(source.url)
+            if (
+                url.scheme not in {"http", "https"}
+                or not url.host
+                or url.userinfo
+                or url.fragment
+                or url.query
+            ):
+                self.err(
+                    "source.url",
+                    "must be an absolute HTTP(S) URL without credentials/query/fragment",
+                )
+            if source.auth.type != "none" and url.scheme != "https":
+                self.err("source.url", "authentication requires HTTPS")
+        except httpx.InvalidURL:
+            self.err("source.url", "must be a valid HTTP(S) URL")
+        query = d.get("query", {})
+        if not isinstance(query, dict) or not all(
+            isinstance(k, str)
+            and k
+            and isinstance(v, (str, int, float, bool))
+            and (not isinstance(v, float) or math.isfinite(v))
+            for k, v in query.items()
+        ):
+            self.err("source.query", "must map non-empty names to finite scalar values")
+        else:
+            source.query = query
+        if source.pagination.param in source.query:
+            self.err("source.query", "must not set the pagination-owned parameter")
+        for key, value in source.headers.items():
+            if (
+                not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key)
+                or any(ord(char) < 32 or ord(char) > 126 for char in value)
+                or key.lower() in {"authorization", "proxy-authorization", "cookie", "host"}
+            ):
+                self.err("source.headers", "invalid or reserved header; use auth for credentials")
+        return source
 
     def pipeline(self, data: Any) -> Pipeline:
-        pipe = Pipeline()
-        d = self.section(data, "pipeline", (), ("select", "rename", "cast", "format"))
-        if d is None:
-            return pipe
-        if "select" in d:
-            sel = d["select"]
-            if not isinstance(sel, list) or not all(isinstance(s, str) and s for s in sel):
-                self.err("pipeline.select", "must be a list of field names")
-            else:
-                pipe.select = sel
-        if "rename" in d:
-            pipe.rename = self.str_map(d, "rename", "pipeline")
-        if "cast" in d:
-            cast = self.str_map(d, "cast", "pipeline")
-            for name, typ in cast.items():
-                if typ not in CAST_TYPES:
-                    self.err(f"pipeline.cast.{name}", f"must be one of {', '.join(CAST_TYPES)}")
-            pipe.cast = cast
-        pipe.format = self.choice(d, "format", "pipeline", FORMATS) or "jsonl"
-        return pipe
-
-    def sink(self, data: Any) -> Sink | None:
-        d = self.section(data, "sink", ("type",), ("limit", "path"))
-        if d is None:
-            return None
-        return Sink(
-            type=self.choice(d, "type", "sink", SINK_TYPES) or "",
-            limit=self.integer(d, "limit", "sink", 10, 1),
-            path=self.string(d, "path", "sink"),
+        d = self.section(
+            data, "pipeline", (), ("type", "select", "rename", "flatten", "format", "csv")
         )
+        pipe = Pipeline(
+            type=self.string(d, "type", "pipeline", "records"),
+            select=self.strings(d, "select", "pipeline") if "select" in d else None,
+            rename=self.string_map(d, "rename", "pipeline"),
+            flatten=self.boolean(d, "flatten", "pipeline"),
+            format=self.choice(d, "format", "pipeline", ("jsonl", "csv")),
+        )
+        if pipe.select is not None:
+            for name in pipe.select:
+                self.path({"field": name}, "field", "pipeline.select")
+            if set(pipe.rename) - set(pipe.select):
+                self.err("pipeline.rename", "keys must refer to selected fields")
+            outputs = [pipe.rename.get(name, name) for name in pipe.select]
+            if len(set(outputs)) != len(outputs):
+                self.err("pipeline.rename", "output names must not collide")
+        if pipe.format == "csv":
+            csv = self.section(d.get("csv", {}), "pipeline.csv", ("columns",), ("json_cells",))
+            pipe.columns = self.strings(csv, "columns", "pipeline.csv")
+            pipe.json_cells = self.boolean(csv, "json_cells", "pipeline.csv")
+            if not pipe.columns:
+                self.err("pipeline.csv.columns", "must declare at least one column")
+        elif "csv" in d:
+            self.err("pipeline.csv", "only valid with CSV format")
+        return pipe
 
 
 def parse(data: Any) -> Connector:
-    """Validate a loaded connector mapping; raise ConfigError listing every problem."""
+    """Validate schema v1; registered adapter names are checked by the runtime."""
     v = _Validator()
-    if not isinstance(data, dict):
-        raise ConfigError(["<root>: must be a mapping"])
-    allowed = {"name", "display_name", "version", "source", "pipeline", "sink"}
-    for key in data:
-        if key not in allowed:
-            v.err(str(key), "unknown key")
-    meta = {k: v.string(data, k, "") for k in ("name", "display_name", "version")}
-    for key in ("source", "sink"):
-        if key not in data:
-            v.err(key, "required section is missing")
-    source = v.source(data["source"]) if "source" in data else None
-    pipeline = v.pipeline(data["pipeline"]) if "pipeline" in data else Pipeline()
-    sink = v.sink(data["sink"]) if "sink" in data else None
-    if v.errors or source is None or sink is None:
-        raise ConfigError(v.errors)
-    return Connector(
-        name=meta["name"],
-        display_name=meta["display_name"],
-        version=meta["version"],
-        source=source,
-        pipeline=pipeline,
-        sink=sink,
+    d = v.section(
+        data,
+        "",
+        ("schema_version", "source", "sink"),
+        ("pipeline", "limit", "name", "display_name", "version"),
     )
+    schema_version = v.integer(d, "schema_version", "<root>", 1, 1, 1)
+    source = v.source(d.get("source", {}))
+    pipeline = v.pipeline(d.get("pipeline", {}))
+    sink_data = v.section(d.get("sink", {}), "sink", ("type", "path"))
+    sink = Sink(
+        type=v.string(sink_data, "type", "sink"),
+        path=v.string(sink_data, "path", "sink"),
+    )
+    limit = v.integer(d, "limit", "<root>", 1, 1, 2**63 - 1) if "limit" in d else None
+    meta = {
+        key: v.string(d, key, "<root>") if key in d else None
+        for key in ("name", "display_name", "version")
+    }
+    if v.errors:
+        raise ConfigError(v.errors)
+    return Connector(schema_version, source, pipeline, sink, limit, **meta)
 
 
 def load(path: str | Path) -> Connector:
-    """Load and validate a connector file."""
+    """Load a definition without resolving credentials or contacting its source."""
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ConfigError([f"{path}: cannot read file ({exc.strerror})"]) from exc
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError([f"{path}: cannot read UTF-8 connector file"]) from exc
+    loader: _StrictSafeLoader | None = None
     try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise ConfigError([f"{path}: invalid YAML ({exc})"]) from exc
+        loader = _StrictSafeLoader(text)
+        data = loader.get_single_data()
+    except yaml.YAMLError:
+        raise ConfigError([f"{path}: invalid YAML"]) from None
+    finally:
+        if loader is not None:
+            loader.dispose()
     return parse(data)

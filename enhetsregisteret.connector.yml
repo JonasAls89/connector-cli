@@ -1,0 +1,24 @@
+schema_version: 1
+name: enhetsregisteret
+display_name: Public Norwegian entities
+limit: 10
+
+source:
+  type: rest
+  url: https://data.brreg.no/enhetsregisteret/api/enheter
+  records_path: _embedded.enheter
+  query:
+    size: 100
+  pagination:
+    type: page
+    param: page
+    start: 0
+    total_pages_path: page.totalPages
+    max_records: 10000
+
+pipeline:
+  format: jsonl
+
+sink:
+  type: local
+  path: enheter.jsonl

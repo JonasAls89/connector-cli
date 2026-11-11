@@ -1,24 +1,27 @@
+schema_version: 1
 name: stripe
-display_name: Stripe API
+display_name: Stripe customers
 version: "1.0.0"
+limit: 10
 
 source:
-  type: stripe
-  resource: customers
-  api:
-    base_url: https://api.stripe.com
-    timeout_seconds: 15
-    retries: 3
+  type: rest
+  url: https://api.stripe.com/v1/customers
+  records_path: data
+  query:
+    limit: 100
   auth:
     type: bearer
     token_env: STRIPE_SECRET_KEY
-  headers:
-    Accept: application/json
-    User-Agent: standardized-api-connector/1.0
+  pagination:
+    type: cursor
+    param: starting_after
+    cursor_path: id
+    has_more_path: has_more
 
 pipeline:
   format: jsonl
 
 sink:
   type: local
-  limit: 10
+  path: stripe-customers.jsonl
