@@ -25,9 +25,9 @@ repos:
       - id: zizmor
   - repo: local
     hooks:
-      - id: automagic-check
-        name: automagic guardrails
-        entry: automagic check
+      - id: pytest
+        name: pytest
+        entry: uv run pytest
         language: system
         pass_filenames: false
-        files: '\.md$'
+        files: '(\.py$|\.connector\.ya?ml$|^pyproject\.toml$|^uv\.lock$)'
