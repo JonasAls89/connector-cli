@@ -26,7 +26,7 @@ dev = [
     "ruff==0.17.2",
     "bandit[toml]==1.9.4",
     "prek",
-    "zizmor==1.31.1",
+    "zizmor==1.32.0",
 ]
 
 [tool.pytest.ini_options]
