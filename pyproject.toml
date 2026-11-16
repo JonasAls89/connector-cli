@@ -23,7 +23,7 @@ packages = ["src/connector_cli"]
 dev = [
     "pytest",
     "pytest-cov",
-    "ruff==0.17.2",
+    "ruff==0.17.4",
     "bandit[toml]==1.9.4",
     "prek",
     "zizmor==1.31.1",
